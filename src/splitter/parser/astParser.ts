@@ -304,7 +304,17 @@ function nodeToRegion(
   sf: ts.SourceFile,
   allLines: string[],
 ): ASTRegion | null {
-  const startLine = lineOf(sf, node.getStart(sf, true));
+  let startPos = node.getStart(sf, true);
+  if (ts.isClassDeclaration(node)) {
+    const decorators = ts.canHaveDecorators(node)
+      ? ts.getDecorators(node)
+      : undefined;
+    if (decorators && decorators.length > 0) {
+      const decoratorStart = decorators[0].getStart(sf, true);
+      if (decoratorStart < startPos) startPos = decoratorStart;
+    }
+  }
+  const startLine = lineOf(sf, startPos);
   const endLine = lineOf(sf, node.getEnd());
   const lines = allLines.slice(startLine - 1, endLine);
   const src = lines.join("\n");

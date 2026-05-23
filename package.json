@@ -144,7 +144,11 @@
         },
         "astra.testFramework": {
           "type": "string",
-          "enum": ["auto", "jest", "vitest"],
+          "enum": [
+            "auto",
+            "jest",
+            "vitest"
+          ],
           "enumDescriptions": [
             "Auto-detect from package.json",
             "Always use Jest",
@@ -180,8 +184,15 @@
         },
         "astra.ignorePatterns": {
           "type": "array",
-          "items": { "type": "string" },
-          "default": ["**/*.d.ts", "**/node_modules/**", "**/dist/**", "**/out/**"],
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "**/*.d.ts",
+            "**/node_modules/**",
+            "**/dist/**",
+            "**/out/**"
+          ],
           "description": "Glob patterns to exclude from analysis."
         }
       }
@@ -218,7 +229,9 @@
   "jest": {
     "preset": "ts-jest",
     "testEnvironment": "node",
-    "testMatch": ["**/__tests__/**/*.test.ts"],
+    "testMatch": [
+      "**/__tests__/**/*.test.ts"
+    ],
     "globals": {
       "ts-jest": {
         "tsconfig": "__tests__/tsconfig.json"

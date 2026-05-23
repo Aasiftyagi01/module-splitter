@@ -13,11 +13,13 @@
  * ╚══════════════════════════════════════════════════════════════════════════════╝
  */
 
+import * as path from "path";
 import type {
   EnrichedRegion,
   SymbolTable,
   ImportRecord,
   WorkspaceContext,
+  TsConfigInfo,
   TypeRouting,
 } from "../types";
 
@@ -51,6 +53,62 @@ function relPath(from: string, to: string): string {
 
   // Strip extension
   return rel.replace(/\.[jt]sx?$/, "");
+}
+
+function normalizeRelPath(p: string): string {
+  return p.replace(/\\/g, "/").replace(/^\.\//, "");
+}
+
+function stripExt(p: string): string {
+  return p.replace(/\.[jt]sx?$/, "");
+}
+
+function resolveAliasPath(
+  absolutePath: string,
+  tsConfig?: TsConfigInfo,
+): string | null {
+  if (!tsConfig?.paths || !tsConfig.baseUrl) return null;
+
+  const target = path.normalize(absolutePath);
+  for (const [alias, patterns] of Object.entries(tsConfig.paths)) {
+    for (const pattern of patterns) {
+      const aliasHasStar = alias.includes("*");
+      const aliasBase = alias.replace(/\*.*$/, "");
+      const patternBase = pattern.replace(/\*.*$/, "");
+      const baseAbs = path.resolve(tsConfig.baseUrl, patternBase);
+
+      if (target !== baseAbs && !target.startsWith(baseAbs + path.sep))
+        continue;
+
+      let suffix = target.slice(baseAbs.length);
+      if (suffix.startsWith(path.sep)) suffix = suffix.slice(1);
+      const suffixPosix = suffix.replace(/\\/g, "/");
+
+      const mapped = aliasHasStar
+        ? alias.replace("*", suffixPosix)
+        : aliasBase + (suffixPosix ? `/${suffixPosix}` : "");
+
+      return stripExt(mapped);
+    }
+  }
+  return null;
+}
+
+function resolveImportPath(
+  fromRel: string,
+  toRel: string,
+  ctx: WorkspaceContext,
+): string {
+  const fromClean = normalizeRelPath(fromRel);
+  const toClean = normalizeRelPath(toRel);
+  const sourceDir =
+    ctx.sourceDir && ctx.sourceDir.length > 0 ? ctx.sourceDir : ".";
+
+  const toAbs = path.resolve(sourceDir, toClean);
+  const aliasPath = resolveAliasPath(toAbs, ctx.tsConfig);
+  if (aliasPath) return aliasPath;
+
+  return relPath(fromClean, toClean);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -206,7 +264,11 @@ export function resolveImports(
   for (const [declRegionId, syms] of fromRegions) {
     const targetFile = proposedFileMap.get(declRegionId)!;
     const declRegion = allRegions.find((r) => r.id === declRegionId)!;
-    const rel = relPath(proposedFileMap.get(region.id) ?? "", targetFile);
+    const rel = resolveImportPath(
+      proposedFileMap.get(region.id) ?? "",
+      targetFile,
+      ctx,
+    );
     const isTypeOnly =
       symbolTable.locals.get(declRegion.name)?.namespace === "type";
     const typePrefix = isTypeOnly ? "type " : "";
@@ -218,9 +280,10 @@ export function resolveImports(
 
   // ── Emit: type-routed imports ─────────────────────────────────────────────
   for (const [targetFile, typeNames] of fromTypeRoute) {
-    const rel = relPath(
+    const rel = resolveImportPath(
       proposedFileMap.get(region.id) ?? "",
       targetFile.replace("./", ""),
+      ctx,
     );
     addImport(`import type { ${typeNames.join(", ")} } from '${rel}';`);
   }
