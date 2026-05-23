@@ -40,7 +40,8 @@ export type SymbolUsageKind =
   | "type"
   | "reexport"
   | "inheritance"
-  | "reference";
+  | "reference"
+  | "cochange";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Symbol Table — produced by the symbol resolver
@@ -83,6 +84,10 @@ export interface ImportRecord {
   namespaceAlias?: string;
   /** Side-effect only: import 'foo/styles.css' */
   isSideEffect: boolean;
+  /** Dynamic import or require call (import('x') / require('x')) */
+  isDynamic?: boolean;
+  /** Original statement text for dynamic imports (best-effort) */
+  statementText?: string;
   /** Start line (1-based) */
   line: number;
 }
@@ -139,6 +144,26 @@ export interface DependencyEdge {
   strength: number; // 0–1  (used for coupling score & partitioning)
   isTypeOnly: boolean; // only type imports → removable at runtime
   isCyclic: boolean;
+  /** Edge participates in an indirect (multi-hop) cycle */
+  isIndirectCycle?: boolean;
+  /** Indirect cycle path (region ids) that this edge belongs to */
+  indirectCyclePath?: string[];
+  /** Co-change coupling strength (0–1) if added from history */
+  coChangeCoupling?: number;
+}
+
+export interface IndirectCycle {
+  from: string;
+  to: string;
+  path: string[];
+}
+
+export interface CoChangeRecord {
+  regionA: string;
+  regionB: string;
+  coChangeCount: number;
+  totalChanges: number;
+  coupling: number; // 0–1
 }
 
 export interface DependencyGraph {
@@ -148,6 +173,8 @@ export interface DependencyGraph {
   topologicalOrder: string[];
   /** Strongly Connected Components (Tarjan's SCC) — each SCC with >1 member is a cycle */
   sccs: string[][];
+  /** Indirect cycles (multi-hop) with stored paths */
+  indirectCycles: IndirectCycle[];
   /** Raw adjacency list for O(1) neighbour lookup */
   adjacency: Map<string, Set<string>>;
   /** Reverse adjacency list for O(1) dependent lookup */
@@ -444,6 +471,15 @@ export interface WorkspaceContext {
   packageManager: "npm" | "yarn" | "pnpm" | "unknown";
   isMonorepo: boolean;
   tsConfig?: TsConfigInfo;
+  /** Optional co-change coupling settings and precomputed records */
+  coChange?: {
+    enabled?: boolean;
+    minCoupling?: number;
+    maxRegions?: number;
+    maxCommits?: number;
+    repoRoot?: string;
+    records?: CoChangeRecord[];
+  };
 }
 
 export interface TsConfigInfo {

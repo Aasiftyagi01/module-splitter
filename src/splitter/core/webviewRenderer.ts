@@ -323,6 +323,7 @@ function buildMiniGraphSVG(plan: SplitPlan): string {
     inheritance: "var(--vscode-terminal-ansiGreen,#4caf50)",
     reexport: "var(--vscode-editorWarning-foreground,#cca700)",
     reference: "var(--vscode-editor-foreground,#d4d4d4)",
+    cochange: "var(--vscode-terminal-ansiYellow,#ffd866)",
   };
   const nodePalette = {
     extractFill: "var(--vscode-editorWarning-foreground,#cca700)",
@@ -354,8 +355,10 @@ function buildMiniGraphSVG(plan: SplitPlan): string {
       const t = posMap.get(e.to)!;
       const color = e.isCyclic
         ? "var(--vscode-editorError-foreground,#f14c4c)"
-        : (edgePalette[e.edgeType] ??
-          "var(--vscode-editor-foreground,#ffffff)");
+        : e.isIndirectCycle
+          ? "var(--vscode-editorWarning-foreground,#cca700)"
+          : (edgePalette[e.edgeType] ??
+            "var(--vscode-editor-foreground,#ffffff)");
       return `<line x1="${f.x}" y1="${f.y}" x2="${t.x}" y2="${t.y}" stroke="${color}" stroke-width="${Math.max(1.8, e.strength * 2.4)}" stroke-opacity="0.95" marker-end="url(#arr)"/>`;
     })
     .join("");

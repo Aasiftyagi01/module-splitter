@@ -19,6 +19,8 @@ import type {
   DependencyGraph,
   DependencyEdge,
   SymbolUsageKind,
+  CoChangeRecord,
+  IndirectCycle,
 } from "../types";
 
 const EDGE_TYPE_WEIGHT: Record<SymbolUsageKind, number> = {
@@ -27,6 +29,7 @@ const EDGE_TYPE_WEIGHT: Record<SymbolUsageKind, number> = {
   reexport: 0,
   inheritance: 2.0,
   reference: 1.0,
+  cochange: 1.2,
 };
 
 const EDGE_TYPE_PRECEDENCE: SymbolUsageKind[] = [
@@ -35,6 +38,7 @@ const EDGE_TYPE_PRECEDENCE: SymbolUsageKind[] = [
   "reference",
   "type",
   "reexport",
+  "cochange",
 ];
 
 function chooseEdgeType(symbolKinds: SymbolUsageKind[]): SymbolUsageKind {
@@ -87,6 +91,71 @@ function isTypeOnlySymbols(
     const entry = table.locals.get(s);
     return entry?.namespace === "type";
   });
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Indirect cycle detection (multi-hop reachability)
+// ─────────────────────────────────────────────────────────────────────────────
+
+function shortestPath(
+  adjacency: Map<string, Set<string>>,
+  from: string,
+  to: string,
+): string[] | null {
+  if (from === to) return [from];
+  const queue: string[] = [from];
+  const prev = new Map<string, string | null>([[from, null]]);
+
+  while (queue.length > 0) {
+    const current = queue.shift()!;
+    for (const nb of adjacency.get(current) ?? new Set()) {
+      if (prev.has(nb)) continue;
+      prev.set(nb, current);
+      if (nb === to) {
+        const path: string[] = [to];
+        let cur: string | null = current;
+        while (cur) {
+          path.unshift(cur);
+          cur = prev.get(cur) ?? null;
+        }
+        return path;
+      }
+      queue.push(nb);
+    }
+  }
+
+  return null;
+}
+
+function detectIndirectCycles(
+  regionIds: string[],
+  adjacency: Map<string, Set<string>>,
+): IndirectCycle[] {
+  const cycles: IndirectCycle[] = [];
+  const seen = new Set<string>();
+
+  for (let i = 0; i < regionIds.length; i++) {
+    for (let j = i + 1; j < regionIds.length; j++) {
+      const a = regionIds[i];
+      const b = regionIds[j];
+      const pathAB = shortestPath(adjacency, a, b);
+      if (!pathAB || pathAB.length < 2) continue;
+      const pathBA = shortestPath(adjacency, b, a);
+      if (!pathBA || pathBA.length < 2) continue;
+
+      const isIndirect = pathAB.length > 2 || pathBA.length > 2;
+      if (!isIndirect) continue;
+
+      const key = `${a}::${b}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+
+      const cyclePath = [...pathAB, ...pathBA.slice(1)];
+      cycles.push({ from: a, to: b, path: cyclePath });
+    }
+  }
+
+  return cycles;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -232,6 +301,7 @@ function computeCohesionScores(
 export function buildDependencyGraph(
   regions: ASTRegion[],
   symbolTable: SymbolTable,
+  coChangeRecords: CoChangeRecord[] = [],
 ): DependencyGraph {
   const regionIds = regions.map((r) => r.id);
   const regionById = new Map(regions.map((r) => [r.id, r]));
@@ -304,6 +374,50 @@ export function buildDependencyGraph(
     }
   }
 
+  // Add co-change coupling edges (symmetrical)
+  if (coChangeRecords.length > 0) {
+    const edgeLookup = new Map<string, DependencyEdge>();
+    for (const edge of edges) {
+      edgeLookup.set(`${edge.from}::${edge.to}`, edge);
+    }
+
+    for (const record of coChangeRecords) {
+      if (!regionById.has(record.regionA) || !regionById.has(record.regionB)) {
+        continue;
+      }
+      const strength = Math.max(0, Math.min(1, record.coupling));
+      const pairs: Array<[string, string]> = [
+        [record.regionA, record.regionB],
+        [record.regionB, record.regionA],
+      ];
+
+      for (const [from, to] of pairs) {
+        const key = `${from}::${to}`;
+        const existing = edgeLookup.get(key);
+        if (existing) {
+          existing.coChangeCoupling = strength;
+          existing.strength = Math.min(1, existing.strength + strength * 0.5);
+          continue;
+        }
+
+        const edge: DependencyEdge = {
+          from,
+          to,
+          symbols: ["__cochange__"],
+          edgeType: "cochange",
+          strength,
+          isTypeOnly: false,
+          isCyclic: false,
+          coChangeCoupling: strength,
+        };
+        edges.push(edge);
+        edgeLookup.set(key, edge);
+        adjacency.get(from)!.add(to);
+        reverseAdjacency.get(to)!.add(from);
+      }
+    }
+  }
+
   // Run Tarjan to find SCCs
   const sccs = tarjanSCC(regionIds, adjacency);
 
@@ -312,6 +426,21 @@ export function buildDependencyGraph(
   for (const edge of edges) {
     if (cyclicIds.has(edge.from) && cyclicIds.has(edge.to)) {
       edge.isCyclic = true;
+    }
+  }
+
+  const indirectCycles = detectIndirectCycles(regionIds, adjacency);
+  if (indirectCycles.length > 0) {
+    for (const cycle of indirectCycles) {
+      for (let i = 0; i < cycle.path.length - 1; i++) {
+        const from = cycle.path[i];
+        const to = cycle.path[i + 1];
+        const edge = edges.find((e) => e.from === from && e.to === to);
+        if (edge && !edge.isCyclic) {
+          edge.isIndirectCycle = true;
+          edge.indirectCyclePath = cycle.path;
+        }
+      }
     }
   }
 
@@ -326,6 +455,7 @@ export function buildDependencyGraph(
     edges,
     topologicalOrder,
     sccs,
+    indirectCycles,
     adjacency,
     reverseAdjacency,
     couplingScores: coupling.total,

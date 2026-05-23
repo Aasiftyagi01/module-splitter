@@ -17,6 +17,7 @@ import {
   detectRegionSmells,
   detectFileSmells,
 } from "../analysis/smellDetector";
+import { buildCoChangeRecordsFromGit } from "../analysis/coChangeDetector";
 import { evaluateExtraction } from "../analysis/extractionOracle";
 import { calibrateThreshold } from "../analysis/thresholdCalibrator";
 import { calibratePerFunction } from "../analysis/perFunctionCalibrator";
@@ -205,7 +206,8 @@ export class ModuleSplitter {
 
     // Stage 1d: Semantic type resolution (optional — graceful degradation on failure)
     // Refines the type-vs-value classification using the TS TypeChecker
-    let semanticInfo = semanticTypeResolver.resolveFile(
+
+    const semanticInfo = semanticTypeResolver.resolveFile(
       filePath || fileName,
       sourceCode,
     );
@@ -233,7 +235,25 @@ export class ModuleSplitter {
     }
 
     // Stage 2: Dependency graph (always rebuilt — O(V+E), negligible)
-    const dependencyGraph = buildDependencyGraph(rawRegions, symbolTable);
+    let coChangeRecords = effectiveCtx.coChange?.records ?? [];
+    if (
+      coChangeRecords.length === 0 &&
+      effectiveCtx.coChange?.enabled &&
+      filePath
+    ) {
+      coChangeRecords = buildCoChangeRecordsFromGit(rawRegions, filePath, {
+        minCoupling: effectiveCtx.coChange.minCoupling,
+        maxRegions: effectiveCtx.coChange.maxRegions,
+        maxCommits: effectiveCtx.coChange.maxCommits,
+        repoRoot: effectiveCtx.coChange.repoRoot,
+      });
+    }
+
+    const dependencyGraph = buildDependencyGraph(
+      rawRegions,
+      symbolTable,
+      coChangeRecords,
+    );
     const cyclicRegionIds = new Set<string>(
       dependencyGraph.sccs.filter((s) => s.length > 1).flat(),
     );
@@ -261,6 +281,8 @@ export class ModuleSplitter {
           raw.lines.length,
           approxCC,
           raw.maxBracketDepth,
+          symbolTable,
+          filePath || fileName,
         );
         const metrics = computeRegionMetrics(raw, smells.length);
         regionSmellMap.set(raw.id, smells);

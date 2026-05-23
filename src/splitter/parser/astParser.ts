@@ -317,6 +317,28 @@ function buildSymbolTable(sf: ts.SourceFile): SymbolTable {
   const imports = new Map<string, ImportRecord>();
   const unresolved = new Set<string>();
 
+  const addDynamicImport = (specifier: string, node: ts.Node): void => {
+    let stmt: ts.Node | undefined = node;
+    while (stmt && !ts.isStatement(stmt)) stmt = stmt.parent;
+    const startNode = stmt ?? node;
+    const line = lineOf(sf, startNode.getStart(sf, true));
+    const statementText = sf.text.slice(
+      startNode.getStart(sf, true),
+      startNode.getEnd(),
+    );
+    const key = `__dynamic__${specifier}:${line}`;
+    if (!imports.has(key)) {
+      imports.set(key, {
+        specifier,
+        named: [],
+        isSideEffect: false,
+        isDynamic: true,
+        statementText: statementText.trim(),
+        line,
+      });
+    }
+  };
+
   ts.forEachChild(sf, (node) => {
     // Import declarations
     if (ts.isImportDeclaration(node)) {
@@ -330,6 +352,7 @@ function buildSymbolTable(sf: ts.SourceFile): SymbolTable {
           specifier,
           named: [],
           isSideEffect: true,
+          isDynamic: false,
           line,
         });
         return;
@@ -339,6 +362,7 @@ function buildSymbolTable(sf: ts.SourceFile): SymbolTable {
         specifier,
         named: [],
         isSideEffect: false,
+        isDynamic: false,
         line,
       };
 
@@ -362,6 +386,29 @@ function buildSymbolTable(sf: ts.SourceFile): SymbolTable {
       imports.set(specifier, rec);
     }
   });
+
+  // Dynamic imports / require() calls
+  const visitDynamic = (node: ts.Node): void => {
+    if (ts.isCallExpression(node)) {
+      if (
+        node.expression.kind === ts.SyntaxKind.ImportKeyword &&
+        node.arguments.length > 0 &&
+        ts.isStringLiteral(node.arguments[0])
+      ) {
+        addDynamicImport(node.arguments[0].text, node);
+      } else if (
+        ts.isIdentifier(node.expression) &&
+        node.expression.text === "require" &&
+        node.arguments.length > 0 &&
+        ts.isStringLiteral(node.arguments[0])
+      ) {
+        addDynamicImport(node.arguments[0].text, node);
+      }
+    }
+    ts.forEachChild(node, visitDynamic);
+  };
+
+  visitDynamic(sf);
 
   return { locals, imports, unresolved };
 }

@@ -16,6 +16,7 @@ import {
   computeRegionMetrics,
 } from "../src/splitter/analysis/metrics";
 import { detectRegionSmells } from "../src/splitter/analysis/smellDetector";
+import { buildCoChangeRecordsFromHistories } from "../src/splitter/analysis/coChangeDetector";
 import { evaluateExtraction } from "../src/splitter/analysis/extractionOracle";
 import { renderSplitPlanHtml } from "../src/splitter/core/webviewRenderer";
 import { resolveImports } from "../src/splitter/resolver/importResolver";
@@ -141,6 +142,19 @@ export function renderItem() {
 `.trim();
 
 const DEFAULT_ARROW = `export default () => <div>Hello</div>;`;
+
+const DYNAMIC_IMPORT_SRC = `
+const { LazyWidget } = await import('./LazyWidget');
+export function useLazy() {
+  return LazyWidget;
+}
+`.trim();
+
+const INDIRECT_CYCLE_SRC = `
+export function A() { return C(); }
+export function B() { return A(); }
+export function C() { return B(); }
+`.trim();
 
 const buildConstLines = (count: number, prefix: string): string =>
   Array.from({ length: count }, (_, i) => `  const ${prefix}${i} = ${i};`).join(
@@ -271,6 +285,20 @@ describe("Stage 1 — parseSourceFile", () => {
     expect(def?.hasJSX).toBe(true);
   });
 
+  it("detects dynamic import and require in the symbol table", () => {
+    const src = `
+const mod = await import('./lazy');
+const req = require('./req');
+export function useIt() { return mod && req; }
+`.trim();
+    const result = parseSourceFile(src, "dynamic.ts");
+    const dynamic = [...result.symbolTable.imports.values()].filter(
+      (rec) => rec.isDynamic,
+    );
+    const specifiers = dynamic.map((rec) => rec.specifier).sort();
+    expect(specifiers).toEqual(["./lazy", "./req"]);
+  });
+
   it("builds import records in SymbolTable", () => {
     const result = parseSourceFile(SIMPLE_COMPONENT, "Counter.tsx");
     const reactImport = result.symbolTable.imports.get("react");
@@ -361,6 +389,40 @@ export function B() {
     if (!a || !b) return;
     expect(graph.outboundCouplingScores.get(a.id) ?? 0).toBeGreaterThan(0);
     expect(graph.inboundCouplingScores.get(b.id) ?? 0).toBeGreaterThan(0);
+  });
+
+  it("flags indirect cycles with multi-hop paths", () => {
+    const parsed = parseSourceFile(INDIRECT_CYCLE_SRC, "cycle.ts");
+    const graph = buildDependencyGraph(parsed.regions, parsed.symbolTable);
+    const nameById = new Map(parsed.regions.map((r) => [r.id, r.name]));
+    const hasCycle = graph.indirectCycles.some((cycle) => {
+      const names = cycle.path.map((id) => nameById.get(id));
+      return names.includes("A") && names.includes("B") && names.includes("C");
+    });
+    expect(hasCycle).toBe(true);
+  });
+
+  it("adds co-change edges when regions always change together", () => {
+    const src = `
+export function Alpha() { return 1; }
+export function Beta() { return 2; }
+export function Gamma() { return 3; }
+`.trim();
+    const parsed = parseSourceFile(src, "cochange.ts");
+    const regionByName = new Map(parsed.regions.map((r) => [r.name, r]));
+    const histories = new Map<string, string[]>([
+      [regionByName.get("Alpha")!.id, ["c1", "c2"]],
+      [regionByName.get("Beta")!.id, ["c1", "c2"]],
+      [regionByName.get("Gamma")!.id, ["c3"]],
+    ]);
+    const records = buildCoChangeRecordsFromHistories(histories, 0.6);
+    const graph = buildDependencyGraph(
+      parsed.regions,
+      parsed.symbolTable,
+      records,
+    );
+    const cochangeEdges = graph.edges.filter((e) => e.edgeType === "cochange");
+    expect(cochangeEdges.length).toBeGreaterThanOrEqual(2);
   });
 
   it("distinguishes call, type, and inheritance edges", () => {
@@ -516,11 +578,21 @@ describe("Stage 3 — Metrics", () => {
 
 describe("Stage 4 — detectRegionSmells", () => {
   it("detects God Component smell", () => {
-    const { regions } = parseSourceFile(GOD_COMPONENT, "Dashboard.tsx");
+    const { regions, symbolTable } = parseSourceFile(
+      GOD_COMPONENT,
+      "Dashboard.tsx",
+    );
     const dashboard = regions.find((r) => r.name === "Dashboard");
     expect(dashboard).toBeDefined();
     if (!dashboard) return;
-    const smells = detectRegionSmells(dashboard, dashboard.lines.length, 5, 4);
+    const smells = detectRegionSmells(
+      dashboard,
+      dashboard.lines.length,
+      5,
+      4,
+      symbolTable,
+      "Dashboard.tsx",
+    );
     const godSmell = smells.find((s) => s.name === "God Component");
     expect(godSmell).toBeDefined();
     expect(godSmell?.severity).toBe("critical");
@@ -534,11 +606,18 @@ export function useBad() {
     setV(1);
   });
 }`.trim();
-    const { regions } = parseSourceFile(src, "bad.ts");
+    const { regions, symbolTable } = parseSourceFile(src, "bad.ts");
     const hook = regions.find((r) => r.kind === "hook");
     expect(hook).toBeDefined();
     if (!hook) return;
-    const smells = detectRegionSmells(hook, hook.lines.length, 2, 2);
+    const smells = detectRegionSmells(
+      hook,
+      hook.lines.length,
+      2,
+      2,
+      symbolTable,
+      "bad.ts",
+    );
     const s = smells.find(
       (s) => s.name === "Missing useEffect Dependency Array",
     );
@@ -552,32 +631,115 @@ export function useAsync() {
     await fetch('/api');
   }, []);
 }`.trim();
-    const { regions } = parseSourceFile(src, "bad.ts");
+    const { regions, symbolTable } = parseSourceFile(src, "bad.ts");
     const hook = regions.find((r) => r.kind === "hook");
     if (!hook) return;
-    const smells = detectRegionSmells(hook, hook.lines.length, 2, 2);
+    const smells = detectRegionSmells(
+      hook,
+      hook.lines.length,
+      2,
+      2,
+      symbolTable,
+      "bad.ts",
+    );
     const s = smells.find((s) => s.name === "Async useEffect");
     expect(s).toBeDefined();
   });
 
   it("detects oversized module", () => {
     const bigFn = `export function big() {\n${Array(250).fill("  const x = 1;").join("\n")}\n}`;
-    const { regions } = parseSourceFile(bigFn, "big.ts");
+    const { regions, symbolTable } = parseSourceFile(bigFn, "big.ts");
     const fn = regions.find((r) => r.kind === "utility-function");
     if (!fn) return;
-    const smells = detectRegionSmells(fn, fn.lines.length, 5, 3);
+    const smells = detectRegionSmells(
+      fn,
+      fn.lines.length,
+      5,
+      3,
+      symbolTable,
+      "big.ts",
+    );
     const s = smells.find((s) => s.name.startsWith("Oversized"));
     expect(s).toBeDefined();
     expect(s?.severity).toBe("critical");
   });
 
   it("returns no smells for clean small function", () => {
-    const { regions } = parseSourceFile(SIMPLE_HOOK, "useToggle.ts");
+    const { regions, symbolTable } = parseSourceFile(
+      SIMPLE_HOOK,
+      "useToggle.ts",
+    );
     const hook = regions.find((r) => r.name === "useToggle");
     if (!hook) return;
-    const smells = detectRegionSmells(hook, hook.lines.length, 2, 2);
+    const smells = detectRegionSmells(
+      hook,
+      hook.lines.length,
+      2,
+      2,
+      symbolTable,
+      "useToggle.ts",
+    );
     const critical = smells.filter((s) => s.severity === "critical");
     expect(critical.length).toBe(0);
+  });
+
+  it("suppresses console logging in API-like regions", () => {
+    const apiSrc = `
+export function apiHandler() { console.log('x'); }
+`.trim();
+    const parsed = parseSourceFile(apiSrc, "api.ts");
+    const apiRegion = parsed.regions.find((r) => r.name === "apiHandler");
+    if (!apiRegion) return;
+    const smells = detectRegionSmells(
+      apiRegion,
+      apiRegion.lines.length,
+      1,
+      1,
+      parsed.symbolTable,
+      "api/route.ts",
+    );
+    expect(smells.some((s) => s.name === "Console Logging")).toBe(false);
+  });
+
+  it("suppresses any-usage smell in type-guard helpers", () => {
+    const src = `
+export function assertIsString(value: any, other: any, extra: any) {
+  return typeof value === 'string' && typeof other === 'string' && !!extra;
+}
+`.trim();
+    const parsed = parseSourceFile(src, "guards.ts");
+    const region = parsed.regions.find((r) => r.name === "assertIsString");
+    if (!region) return;
+    const smells = detectRegionSmells(
+      region,
+      region.lines.length,
+      1,
+      1,
+      parsed.symbolTable,
+      "guards.ts",
+    );
+    expect(smells.some((s) => s.name === "Excessive `any` Usage")).toBe(false);
+  });
+});
+
+describe("Stage 4b — Dynamic import preservation", () => {
+  it("carries forward adjacent dynamic import statements", () => {
+    const parsed = parseSourceFile(DYNAMIC_IMPORT_SRC, "lazy.ts");
+    const region = parsed.regions.find((r) => r.name === "useLazy");
+    if (!region) return;
+    const map = new Map<string, string>([[region.id, "hooks/useLazy.ts"]]);
+    const resolved = resolveImports(
+      makeEnrichedRegion(region),
+      parsed.regions.map(makeEnrichedRegion),
+      parsed.symbolTable,
+      map,
+      [],
+      makeCtx(),
+    );
+    const hasDynamic = resolved.statements.some((s) =>
+      s.includes("import('./LazyWidget')"),
+    );
+    expect(hasDynamic).toBe(true);
   });
 });
 

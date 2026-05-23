@@ -121,6 +121,7 @@ function findImportSource(
   symbolTable: SymbolTable,
 ): ImportRecord | null {
   for (const [, rec] of symbolTable.imports) {
+    if (rec.isDynamic) continue;
     if (rec.defaultAlias === symbol) return rec;
     if (rec.namespaceAlias === symbol) return rec;
     if (rec.named.some((n) => n.alias === symbol)) return rec;
@@ -167,10 +168,35 @@ export function resolveImports(
 
   // Side-effect imports adjacent to this region in the source file
   const sideEffectImports = [...symbolTable.imports.values()].filter(
-    (rec) => rec.isSideEffect && Math.abs(rec.line - region.startLine) <= 3,
+    (rec) =>
+      rec.isSideEffect &&
+      !rec.isDynamic &&
+      Math.abs(rec.line - region.startLine) <= 3,
   );
   for (const rec of sideEffectImports) {
     addImport(`import '${rec.specifier}';`);
+    if (
+      !rec.specifier.startsWith(".") &&
+      !externalPackages.includes(rec.specifier)
+    ) {
+      externalPackages.push(rec.specifier);
+    }
+  }
+
+  // Dynamic import statements adjacent to this region in the source file
+  const dynamicImports = [...symbolTable.imports.values()].filter(
+    (rec) =>
+      rec.isDynamic &&
+      rec.statementText &&
+      rec.line < region.startLine &&
+      Math.abs(rec.line - region.startLine) <= 3,
+  );
+  for (const rec of dynamicImports) {
+    addImport(
+      rec.statementText!.trim().endsWith(";")
+        ? rec.statementText!.trim()
+        : `${rec.statementText!.trim()};`,
+    );
     if (
       !rec.specifier.startsWith(".") &&
       !externalPackages.includes(rec.specifier)
