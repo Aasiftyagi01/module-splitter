@@ -48,6 +48,11 @@ function chooseEdgeType(symbolKinds: SymbolUsageKind[]): SymbolUsageKind {
   return "reference";
 }
 
+function externalDependencyWeight(symbolKinds: SymbolUsageKind[]): number {
+  const edgeType = chooseEdgeType(symbolKinds);
+  return 0.2 * EDGE_TYPE_WEIGHT[edgeType];
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Edge builder
 // ─────────────────────────────────────────────────────────────────────────────
@@ -374,6 +379,38 @@ export function buildDependencyGraph(
     }
   }
 
+  const externalCoupling = new Map<string, number>(
+    regionIds.map((id) => [id, 0]),
+  );
+
+  for (const region of regions) {
+    const usageKinds = region.symbolUsageKinds ?? new Map();
+    const seen = new Set<string>();
+    for (const rec of symbolTable.imports.values()) {
+      const aliases: string[] = [];
+      if (rec.defaultAlias) aliases.push(rec.defaultAlias);
+      if (rec.namespaceAlias) aliases.push(rec.namespaceAlias);
+      for (const named of rec.named) aliases.push(named.alias);
+
+      for (const alias of aliases) {
+        if (!region.usedSymbols.has(alias)) continue;
+        if (region.localBindings.has(alias)) continue;
+        if (symbolTable.locals.has(alias)) continue;
+        const key = `${rec.specifier}:${alias}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        const kinds = usageKinds.get(alias) ?? ["reference"];
+        const weight = externalDependencyWeight(kinds);
+        if (weight > 0) {
+          externalCoupling.set(
+            region.id,
+            (externalCoupling.get(region.id) ?? 0) + weight,
+          );
+        }
+      }
+    }
+  }
+
   // Add co-change coupling edges (symmetrical)
   if (coChangeRecords.length > 0) {
     const edgeLookup = new Map<string, DependencyEdge>();
@@ -449,6 +486,11 @@ export function buildDependencyGraph(
 
   // Coupling & cohesion
   const coupling = computeCouplingScores(regionIds, edges);
+  for (const [id, weight] of externalCoupling) {
+    if (weight <= 0) continue;
+    coupling.outbound.set(id, (coupling.outbound.get(id) ?? 0) + weight);
+    coupling.total.set(id, (coupling.total.get(id) ?? 0) + weight);
+  }
   const cohesionScores = computeCohesionScores(regions, edges);
 
   return {

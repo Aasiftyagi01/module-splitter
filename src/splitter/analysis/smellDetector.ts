@@ -8,6 +8,7 @@
  * ╚══════════════════════════════════════════════════════════════════════════════╝
  */
 
+import * as ts from "typescript";
 import type { ASTRegion, CodeSmell, RegionKind, SymbolTable } from "../types";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -16,6 +17,175 @@ import type { ASTRegion, CodeSmell, RegionKind, SymbolTable } from "../types";
 
 function count(src: string, re: RegExp): number {
   return (src.match(re) ?? []).length;
+}
+
+function scriptKindFromPath(filePath: string): ts.ScriptKind {
+  const ext = filePath.split(".").pop()?.toLowerCase();
+  if (ext === "tsx" || ext === "jsx") return ts.ScriptKind.TSX;
+  if (ext === "js" || ext === "mjs" || ext === "cjs") return ts.ScriptKind.JS;
+  return ts.ScriptKind.TS;
+}
+
+function normalizeAstFingerprint(node: ts.Node): string {
+  const identMap = new Map<string, number>();
+  let identCount = 0;
+
+  const walk = (n: ts.Node): string => {
+    if (ts.isIdentifier(n)) {
+      const key = n.text;
+      if (!identMap.has(key)) identMap.set(key, identCount++);
+      return `ID_${identMap.get(key)}`;
+    }
+    if (
+      ts.isStringLiteral(n) ||
+      ts.isNumericLiteral(n) ||
+      ts.isNoSubstitutionTemplateLiteral(n) ||
+      n.kind === ts.SyntaxKind.TemplateHead ||
+      n.kind === ts.SyntaxKind.TemplateMiddle ||
+      n.kind === ts.SyntaxKind.TemplateTail
+    ) {
+      return "LIT";
+    }
+    const children: string[] = [];
+    ts.forEachChild(n, (child) => children.push(walk(child)));
+    return `${ts.SyntaxKind[n.kind]}(${children.join(",")})`;
+  };
+
+  return walk(node);
+}
+
+function collectAstFingerprints(
+  src: string,
+  scriptKind: ts.ScriptKind,
+): string[] {
+  const sf = ts.createSourceFile(
+    "region.tsx",
+    src,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKind,
+  );
+  const fingerprints: string[] = [];
+
+  const addStatementSequence = (statements: readonly ts.Statement[]): void => {
+    if (statements.length < 3) return;
+    const stmtPrints = statements.map((stmt) => normalizeAstFingerprint(stmt));
+    for (let i = 0; i <= stmtPrints.length - 3; i++) {
+      const seqTextLen =
+        statements[i].getText(sf).length +
+        statements[i + 1].getText(sf).length +
+        statements[i + 2].getText(sf).length;
+      if (seqTextLen < 60) continue;
+      const chunk = stmtPrints.slice(i, i + 3).join("|");
+      if (chunk.length < 80) continue;
+      fingerprints.push(chunk);
+    }
+  };
+
+  const visit = (node: ts.Node): void => {
+    if (ts.isSourceFile(node) || ts.isBlock(node)) {
+      addStatementSequence(node.statements);
+    }
+    ts.forEachChild(node, visit);
+  };
+
+  visit(sf);
+  return fingerprints;
+}
+
+function detectHookRuleViolations(
+  region: ASTRegion,
+  src: string,
+  filePath: string,
+): RegionSmell[] {
+  const smells: RegionSmell[] = [];
+  const scriptKind = scriptKindFromPath(filePath);
+  const sf = ts.createSourceFile(
+    "hook.tsx",
+    src,
+    ts.ScriptTarget.Latest,
+    true,
+    scriptKind,
+  );
+
+  let hasHookCall = false;
+  let hasConditionalHook = false;
+  let hasLoopHook = false;
+
+  const isHookCall = (node: ts.Node): boolean =>
+    ts.isCallExpression(node) &&
+    ts.isIdentifier(node.expression) &&
+    /^use[A-Z]/.test(node.expression.text);
+
+  const walk = (node: ts.Node, inBranch: boolean, inLoop: boolean): void => {
+    if (isHookCall(node)) {
+      hasHookCall = true;
+      if (inBranch) hasConditionalHook = true;
+      if (inLoop) hasLoopHook = true;
+    }
+
+    if (
+      ts.isIfStatement(node) ||
+      ts.isConditionalExpression(node) ||
+      ts.isSwitchStatement(node)
+    ) {
+      ts.forEachChild(node, (child) => walk(child, true, inLoop));
+      return;
+    }
+
+    if (
+      ts.isForStatement(node) ||
+      ts.isForInStatement(node) ||
+      ts.isForOfStatement(node) ||
+      ts.isWhileStatement(node) ||
+      ts.isDoStatement(node)
+    ) {
+      ts.forEachChild(node, (child) => walk(child, inBranch, true));
+      return;
+    }
+
+    ts.forEachChild(node, (child) => walk(child, inBranch, inLoop));
+  };
+
+  walk(sf, false, false);
+
+  if (hasConditionalHook) {
+    smells.push({
+      name: "Hook Called Inside Condition",
+      severity: "critical",
+      description: "Hook call detected inside a conditional branch",
+      recommendation: "Move hook calls to the top level of the component/hook",
+      autoFixable: false,
+    });
+  }
+
+  if (hasLoopHook) {
+    smells.push({
+      name: "Hook Called Inside Loop",
+      severity: "critical",
+      description: "Hook call detected inside a loop",
+      recommendation: "Move hook calls to the top level of the component/hook",
+      autoFixable: false,
+    });
+  }
+
+  const allowedKinds = new Set<RegionKind>([
+    "hook",
+    "react-component",
+    "context-provider",
+    "hoc",
+  ]);
+  if (hasHookCall && !allowedKinds.has(region.kind)) {
+    smells.push({
+      name: "Hook Called Outside Component/Hook",
+      severity: "critical",
+      description: "Hook call detected in a non-component, non-hook region",
+      recommendation: "Move hook usage into a React component or a custom hook",
+      autoFixable: false,
+    });
+  }
+
+  return smells;
 }
 
 export interface RegionSmell {
@@ -181,6 +351,10 @@ export function detectRegionSmells(
     }
   }
 
+  if (region.hasHooks || /^use[A-Z]/.test(region.name)) {
+    smells.push(...detectHookRuleViolations(region, src, filePath));
+  }
+
   // ── General smells ───────────────────────────────────────────────────────
 
   if (lineCount > 200) {
@@ -333,25 +507,23 @@ export function detectFileSmells(
 ): CodeSmell[] {
   const fileSmells: CodeSmell[] = [];
 
-  // Duplicate logic fingerprinting — identical line sequences across regions
-  const lineFingerprints = new Map<string, string[]>();
+  // Duplicate logic fingerprinting — normalized AST fingerprints
+  const astFingerprints = new Map<string, string[]>();
 
   for (const region of regions) {
-    for (let i = 0; i < region.lines.length - 3; i++) {
-      const chunk = region.lines
-        .slice(i, i + 3)
-        .map((l) => l.trim())
-        .filter((l) => l.length > 10)
-        .join("|");
-      if (chunk.length < 30) continue;
-
-      const existing = lineFingerprints.get(chunk) ?? [];
+    const scriptKind = region.hasJSX ? ts.ScriptKind.TSX : ts.ScriptKind.TS;
+    const fingerprints = collectAstFingerprints(
+      region.lines.join("\n"),
+      scriptKind,
+    );
+    for (const fp of fingerprints) {
+      const existing = astFingerprints.get(fp) ?? [];
       existing.push(region.id);
-      lineFingerprints.set(chunk, existing);
+      astFingerprints.set(fp, existing);
     }
   }
 
-  const duplicates = [...lineFingerprints.entries()]
+  const duplicates = [...astFingerprints.entries()]
     .filter(([, ids]) => new Set(ids).size > 1)
     .map(([, ids]) => [...new Set(ids)]);
 

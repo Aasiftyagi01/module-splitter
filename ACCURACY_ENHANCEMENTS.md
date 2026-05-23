@@ -1,6 +1,6 @@
 # ASTra v3 — Accuracy Enhancement Roadmap
 
-> Every item here improves the *correctness* of ASTra's decisions — not just speed or UX. Each section explains the current gap, the exact failure mode it causes, the fix, and its measurable impact on extraction decision accuracy.
+> Every item here improves the _correctness_ of ASTra's decisions — not just speed or UX. Each section explains the current gap, the exact failure mode it causes, the fix, and its measurable impact on extraction decision accuracy.
 
 ---
 
@@ -12,6 +12,7 @@ ASTra's core job is to answer two questions correctly for every region in every 
 2. **If extracted, what import statements does it need?** (ImportResolver)
 
 A wrong answer to question 1 causes either:
+
 - **False positive** — a region is extracted that shouldn't be (creates unnecessary files, fragments cohesive logic)
 - **False negative** — a region stays that should be extracted (the God Component problem remains)
 
@@ -28,6 +29,7 @@ The current false positive rate is ~4% and false negative rate is ~6% against th
 **Current gap:** When a class has decorators (`@Component`, `@Injectable`, `@Entity`), the `startLine` of the region is set to the class keyword line, not the decorator line. This means the leading decorator is orphaned — it stays in the source file when the class is extracted, breaking the generated file.
 
 **Failure mode:**
+
 ```ts
 // Source file:
 @Injectable({ providedIn: 'root' })  // ← stays in source after extraction
@@ -35,8 +37,10 @@ export class AuthService { ... }      // ← extracted to services/auth-service.
 ```
 
 **Fix:** In `astParser.ts`, when `ts.isClassDeclaration(node)` and `node.decorators?.length > 0`, walk backward from `node.getStart()` to include decorator positions:
+
 ```ts
-const decoratorStart = node.decorators?.[0]?.getStart(sf, true) ?? node.getStart(sf, true);
+const decoratorStart =
+  node.decorators?.[0]?.getStart(sf, true) ?? node.getStart(sf, true);
 const startLine = lineOf(sf, decoratorStart);
 ```
 
@@ -47,30 +51,39 @@ const startLine = lineOf(sf, decoratorStart);
 ### A2 — Chained Method Call Region Classification
 
 **Current gap:** A region like:
+
 ```ts
 export const userQuery = db
-  .select('users')
-  .where('active', true)
-  .orderBy('name')
+  .select("users")
+  .where("active", true)
+  .orderBy("name")
   .limit(100);
 ```
+
 is classified as `constant-block` because it's a `VariableStatement` with a non-function initializer. But it's really a service/utility that has data-fetching semantics — it should be classified as `utility-function` with `hasAsyncOps: true`.
 
 **Failure mode:** The `constant-block` kind affinity is 0.40, so it rarely gets extracted even when large. These query builders often grow to 20–30 lines and should live in a `queries/` file.
 
 **Fix:** In `astParser.ts` variable statement handler, add a chain-detection pass:
+
 ```ts
 // If the initializer is a property access chain ≥ 3 calls deep
 function isChainedCall(node: ts.Node): boolean {
   let depth = 0;
   let current = node;
-  while (ts.isCallExpression(current) || ts.isPropertyAccessExpression(current)) {
+  while (
+    ts.isCallExpression(current) ||
+    ts.isPropertyAccessExpression(current)
+  ) {
     depth++;
-    current = ts.isCallExpression(current) ? current.expression : (current as ts.PropertyAccessExpression).expression;
+    current = ts.isCallExpression(current)
+      ? current.expression
+      : (current as ts.PropertyAccessExpression).expression;
   }
   return depth >= 3;
 }
 ```
+
 Classify as `utility-function` with `hasAsyncOps: /\bawait\b|\.then\b|Promise/.test(src)`.
 
 **Impact:** Correctly classifies builder patterns, ORM queries, test fixtures. Fixes ~8% of false negatives in service-layer files.
@@ -80,11 +93,13 @@ Classify as `utility-function` with `hasAsyncOps: /\bawait\b|\.then\b|Promise/.t
 ### A3 — Multi-Declaration Variable Statement Splitting
 
 **Current gap:** The AST parser handles `VariableStatement` by iterating its declarations but only emits a region for the first matched pattern. A statement like:
+
 ```ts
 export const formatDate = (d: Date) => d.toISOString(),
              parseDate  = (s: string) => new Date(s),
              addDays    = (d: Date, n: number) => { ... };
 ```
+
 (a single `VariableStatement` with three `VariableDeclaration` nodes) currently emits only one region named `formatDate`. The other two are invisible.
 
 **Fix:** In `astParser.ts`, when a `VariableStatement` has multiple declarations, emit one region per declaration that has a function initializer. Each region gets the same `startLine`/`endLine` as its specific declaration, not the whole statement.
@@ -98,6 +113,7 @@ export const formatDate = (d: Date) => d.toISOString(),
 **Current gap:** A function starting with a lowercase letter that returns JSX is classified as `utility-function` (kind affinity 0.60) not `react-component` (affinity 0.65). This matters because lowercase-named helpers that return JSX (e.g. `renderItem`, `listRow`) are JSX-first and should use the component classification path.
 
 **Current classification:**
+
 ```ts
 // Classified as utility-function because name starts lowercase:
 export function renderUserCard(user: User) {
@@ -106,9 +122,10 @@ export function renderUserCard(user: User) {
 ```
 
 **Fix:** Add a fourth classification signal in `classifyName()`:
+
 ```ts
 // After all name-pattern checks, before fallback:
-if (hasJSX && !hasHooks) return 'react-component'; // JSX overrides name convention
+if (hasJSX && !hasHooks) return "react-component"; // JSX overrides name convention
 ```
 
 **Impact:** Roughly 5% of component-like utilities are misclassified. Correct classification raises their affinity from 0.60 to 0.65 and enables JSX-specific smell rules.
@@ -120,13 +137,15 @@ if (hasJSX && !hasHooks) return 'react-component'; // JSX overrides name convent
 **Current gap:** `export default () => <App />` is treated as `DefaultExport` with name `DefaultExport` (the fallback string). The generated file gets an unusable name: `components/default-export.tsx`. The region also loses its JSX/hooks flags because the expression isn't traversed.
 
 **Fix:** In `nodeToRegion`, for `ExportAssignment`:
+
 ```ts
 // Additional: if expression is an arrow/fn with JSX, name it from the file
 if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)) {
   const inferredName = path.basename(fileName, path.extname(fileName));
   // PascalCase the file name: 'user-card' → 'UserCard'
-  name = inferredName.replace(/-([a-z])/g, (_, c) => c.toUpperCase())
-                     .replace(/^[a-z]/, c => c.toUpperCase());
+  name = inferredName
+    .replace(/-([a-z])/g, (_, c) => c.toUpperCase())
+    .replace(/^[a-z]/, (c) => c.toUpperCase());
 }
 ```
 
@@ -141,6 +160,7 @@ if (ts.isArrowFunction(expr) || ts.isFunctionExpression(expr)) {
 **Current gap:** The dependency graph only creates edges for symbols that are directly declared in a sibling region. If region A uses `formatCurrency` which is defined in the workspace (not in the current file), no edge is created — so A's `importedSymbols` is empty and its coupling score is 0. This makes A look cheaper to extract than it is.
 
 **Fix:** In `buildDependencyGraph`, after the intra-file edge pass, add a cross-file resolution pass using `SymbolTable.imports`:
+
 ```ts
 for (const [specifier, importRecord] of symbolTable.imports) {
   for (const { alias } of importRecord.named) {
@@ -151,6 +171,7 @@ for (const [specifier, importRecord] of symbolTable.imports) {
   }
 }
 ```
+
 External dependencies contribute to coupling score but don't create edges (since external files aren't regions).
 
 **Impact:** Regions heavily dependent on external APIs/services get realistic coupling scores. Fixes the "trivial-looking but deeply coupled" false negative pattern.
@@ -159,22 +180,25 @@ External dependencies contribute to coupling score but don't create edges (since
 
 ### B2 — Call Graph vs Symbol Graph
 
-**Current gap:** The dependency graph is a *symbol reference* graph — it tracks which symbols each region mentions. But it doesn't distinguish between:
-- Region A *calls* region B's function (strong runtime coupling)
-- Region A *imports* region B's type (type-only, erased at compile time)
-- Region A *re-exports* region B's symbol (no coupling at all)
+**Current gap:** The dependency graph is a _symbol reference_ graph — it tracks which symbols each region mentions. But it doesn't distinguish between:
+
+- Region A _calls_ region B's function (strong runtime coupling)
+- Region A _imports_ region B's type (type-only, erased at compile time)
+- Region A _re-exports_ region B's symbol (no coupling at all)
 
 All three create identical edges with the same strength.
 
 **Fix:** In `buildDependencyGraph`, classify each edge more precisely:
+
 ```ts
 enum EdgeType {
-  Call       = 'call',      // A calls B() directly
-  TypeUse    = 'type',      // A uses B as a type annotation only
-  ReExport   = 'reexport',  // A re-exports B
-  Inheritance = 'extends',  // A extends/implements B
+  Call = "call", // A calls B() directly
+  TypeUse = "type", // A uses B as a type annotation only
+  ReExport = "reexport", // A re-exports B
+  Inheritance = "extends", // A extends/implements B
 }
 ```
+
 Derive type from the AST context: `CallExpression` → `Call`, within `TypeReference`/`AsExpression` → `TypeUse`, within `ExportDeclaration` → `ReExport`, within `HeritageClause` → `Inheritance`.
 
 Adjust edge strength multipliers: `Call` → 1.5×, `TypeUse` → 0.1×, `ReExport` → 0×, `Inheritance` → 2.0×.
@@ -198,6 +222,7 @@ Adjust edge strength multipliers: `Call` → 1.5×, `TypeUse` → 0.1×, `ReExpo
 **Current gap:** `import './styles.css'`, `import 'reflect-metadata'` (Angular), and `import '@/polyfills'` are currently classified as `isSideEffect: true` in the SymbolTable but are completely ignored in the ImportResolver. When a region is extracted, its side-effect imports are dropped from the generated file.
 
 **Failure mode:**
+
 ```ts
 // Original file — the style import makes the component work:
 import './UserCard.module.css';
@@ -208,10 +233,13 @@ export const UserCard = () => <div className={styles.card}>...</div>; // broken
 ```
 
 **Fix:** In `ImportResolver.resolveImports()`, always carry forward side-effect imports from the original file that occur adjacent (within 3 lines) to the region being extracted:
+
 ```ts
 const adjacentSideEffects = symbolTable.imports
   .values()
-  .filter(rec => rec.isSideEffect && Math.abs(rec.line - region.startLine) <= 3);
+  .filter(
+    (rec) => rec.isSideEffect && Math.abs(rec.line - region.startLine) <= 3,
+  );
 for (const se of adjacentSideEffects) {
   addImport(`import '${se.specifier}';`);
 }
@@ -226,6 +254,7 @@ for (const se of adjacentSideEffects) {
 ### C1 — Token-Aware Halstead Operator Extraction
 
 **Current gap:** The current Halstead implementation uses a regex over raw source text. This means:
+
 - String literals like `"if (a > b)"` contribute `if`, `>` as operators — they shouldn't
 - Template literal expressions `\`value: ${x + y}\`` contribute operators inside the literal
 - Comments like `// TODO: a > b` contribute `>` as an operator
@@ -233,17 +262,18 @@ for (const se of adjacentSideEffects) {
 This causes Halstead Volume and Effort to be overestimated by ~15% on average for files with lots of strings and comments.
 
 **Fix:** Use the TypeScript Compiler API token stream instead of regex:
+
 ```ts
 function halsteadFromTokens(sf: ts.SourceFile): HalsteadMetrics {
   const operators = new Map<string, number>();
-  const operands  = new Map<string, number>();
-  
+  const operands = new Map<string, number>();
+
   ts.forEachToken(sf, (token) => {
     // Skip tokens inside string/template literals and comments
     if (isInsideLiteral(token, sf)) return;
-    
+
     if (isOperatorToken(token.kind)) {
-      const op = ts.tokenToString(token.kind) ?? 'unknown';
+      const op = ts.tokenToString(token.kind) ?? "unknown";
       operators.set(op, (operators.get(op) ?? 0) + 1);
     } else if (token.kind === ts.SyntaxKind.Identifier) {
       const text = sf.text.slice(token.pos, token.end);
@@ -263,18 +293,19 @@ function halsteadFromTokens(sf: ts.SourceFile): HalsteadMetrics {
 **Current gap:** All branch types count equally in CC. But a `catch` clause (error handling, rarely tested) and an `if` inside a React event handler (usually trivial) both add 1 to CC. This undervalues error-handling complexity and overvalues simple conditionals.
 
 **Fix:** Apply a weight multiplier per branch type:
+
 ```ts
 const BRANCH_WEIGHTS = {
-  'if':     1.0,
-  'else':   0.5,    // else is rarely the complex path
-  'switch': 1.0,
-  'case':   0.8,    // cases within a switch are correlated
-  'catch':  1.5,    // error handling is inherently complex to test
-  'for':    1.2,    // loops compound complexity faster
-  'while':  1.3,
-  '&&':     0.7,    // boolean connectives are lighter than branches
-  '||':     0.7,
-  '??':     0.3,    // null coalescing is almost never a bug source
+  if: 1.0,
+  else: 0.5, // else is rarely the complex path
+  switch: 1.0,
+  case: 0.8, // cases within a switch are correlated
+  catch: 1.5, // error handling is inherently complex to test
+  for: 1.2, // loops compound complexity faster
+  while: 1.3,
+  "&&": 0.7, // boolean connectives are lighter than branches
+  "||": 0.7,
+  "??": 0.3, // null coalescing is almost never a bug source
 };
 ```
 
@@ -286,25 +317,29 @@ Store as `weightedCyclomaticComplexity` alongside the standard `cyclomaticComple
 
 ### C3 — Comment Quality Metric
 
-**Current gap:** ASTra counts comment lines but doesn't evaluate comment *quality*. A region with 20 lines of `// TODO` and `// FIXME` comments technically has high comment density but poor documentation. A region with a complete JSDoc block is highly documented but has the same metric value as one with scattered inline comments.
+**Current gap:** ASTra counts comment lines but doesn't evaluate comment _quality_. A region with 20 lines of `// TODO` and `// FIXME` comments technically has high comment density but poor documentation. A region with a complete JSDoc block is highly documented but has the same metric value as one with scattered inline comments.
 
 **Fix:** Add a `commentQuality` metric (0–100):
+
 ```ts
 function commentQuality(src: string): number {
   let score = 50; // baseline
-  
+
   // JSDoc present: +30
   if (/\/\*\*[\s\S]*?\*\//.test(src)) score += 30;
-  
+
   // @param, @returns documented: +10 each (capped at +20)
   score += Math.min(20, (src.match(/@param|@returns/g) ?? []).length * 10);
-  
+
   // TODO/FIXME comments: -10 each (capped at -30)
-  score -= Math.min(30, (src.match(/\/\/.*(?:TODO|FIXME|HACK)/g) ?? []).length * 10);
-  
+  score -= Math.min(
+    30,
+    (src.match(/\/\/.*(?:TODO|FIXME|HACK)/g) ?? []).length * 10,
+  );
+
   // Commented-out code (lines starting with //\s+[a-z]): -5 each (capped -20)
   score -= Math.min(20, (src.match(/^\s*\/\/\s+[a-z]/gm) ?? []).length * 5);
-  
+
   return Math.max(0, Math.min(100, score));
 }
 ```
@@ -318,18 +353,25 @@ Feed into Maintainability Index as an additional term. Affects both the MI displ
 ### C4 — Nesting Depth: AST vs Bracket-Count
 
 **Current gap:** `maxBracketDepth` is computed by counting `{`, `(`, `[` characters in raw source. This is wrong for two reasons:
+
 1. Brackets in string literals and template expressions are counted
 2. Object destructuring `const { a, b } = obj` counts as 1 nesting level when it adds 0 actual control nesting
 
 **Fix:** Compute nesting depth via TypeScript AST, tracking only control-flow nodes:
+
 ```ts
 function controlFlowNestingDepth(node: ts.Node): number {
   const CONTROL_FLOW_KINDS = new Set([
-    ts.SyntaxKind.IfStatement, ts.SyntaxKind.ForStatement,
-    ts.SyntaxKind.ForInStatement, ts.SyntaxKind.ForOfStatement,
-    ts.SyntaxKind.WhileStatement, ts.SyntaxKind.DoStatement,
-    ts.SyntaxKind.SwitchStatement, ts.SyntaxKind.TryStatement,
-    ts.SyntaxKind.FunctionDeclaration, ts.SyntaxKind.ArrowFunction,
+    ts.SyntaxKind.IfStatement,
+    ts.SyntaxKind.ForStatement,
+    ts.SyntaxKind.ForInStatement,
+    ts.SyntaxKind.ForOfStatement,
+    ts.SyntaxKind.WhileStatement,
+    ts.SyntaxKind.DoStatement,
+    ts.SyntaxKind.SwitchStatement,
+    ts.SyntaxKind.TryStatement,
+    ts.SyntaxKind.FunctionDeclaration,
+    ts.SyntaxKind.ArrowFunction,
     ts.SyntaxKind.FunctionExpression,
   ]);
 
@@ -337,9 +379,9 @@ function controlFlowNestingDepth(node: ts.Node): number {
   function walk(n: ts.Node, depth: number) {
     if (CONTROL_FLOW_KINDS.has(n.kind)) {
       maxDepth = Math.max(maxDepth, depth + 1);
-      ts.forEachChild(n, child => walk(child, depth + 1));
+      ts.forEachChild(n, (child) => walk(child, depth + 1));
     } else {
-      ts.forEachChild(n, child => walk(child, depth));
+      ts.forEachChild(n, (child) => walk(child, depth));
     }
   }
   walk(node, 0);
@@ -358,18 +400,21 @@ Store as `controlFlowNestingDepth` alongside `nestingDepth`.
 ### D1 — Region Interaction Graph for Coupling Score
 
 **Current gap:** Coupling score is computed as a simple sum of edge strengths. This doesn't distinguish between:
+
 - A region that is the **root** of many dependencies (many things import from it) — should stay in the source file as a stable anchor
 - A region that has many **outgoing** dependencies (it imports many things) — a good extraction candidate
 
 **Fix:** Split coupling into `inboundCoupling` (things that depend on this region) and `outboundCoupling` (things this region depends on):
+
 ```ts
 inboundCoupling  = Σ strength(e) for edges e where e.to === region.id
 outboundCoupling = Σ strength(e) for edges e where e.from === region.id
 ```
 
-Extraction pressure comes from **high outbound coupling** (region depends on many things → it has too many responsibilities). **High inbound coupling** is a reason to *not* extract (many things would break if this changes).
+Extraction pressure comes from **high outbound coupling** (region depends on many things → it has too many responsibilities). **High inbound coupling** is a reason to _not_ extract (many things would break if this changes).
 
 Update ExtractionOracle dimensions:
+
 - `coupling_pressure` → now uses `outboundCoupling`
 - New dimension: `stability_reward` — high `inboundCoupling` reduces extraction score (stable shared utility should stay)
 
@@ -382,15 +427,17 @@ Update ExtractionOracle dimensions:
 **Current gap:** The ExtractionOracle treats all regions as equally "stable" — it doesn't know whether a region was written yesterday and changes daily, or was written 2 years ago and hasn't changed since.
 
 **Fix:** Optionally integrate `git log --follow -n 1 --format="%at" -- <file>` to get the last modification time per file, and `git log --L <startLine>,<endLine>:<file>` to get per-region change frequency:
+
 ```ts
 interface GitHistory {
   lastModifiedDaysAgo: number;
-  changeFrequency: number;  // changes per month over last 6 months
-  authorCount: number;       // how many different authors touched it
+  changeFrequency: number; // changes per month over last 6 months
+  authorCount: number; // how many different authors touched it
 }
 ```
 
 Feed into Oracle as a new dimension:
+
 - Recently changed + high frequency → **higher extraction pressure** (volatile, unstable)
 - Unchanged for >6 months + low frequency → **lower extraction pressure** (stable, don't disturb)
 
@@ -408,9 +455,9 @@ Feed into Oracle as a new dimension:
 interface CoChangeRecord {
   fileA: string;
   fileB: string;
-  coChangeCount: number;    // times both changed in same commit
+  coChangeCount: number; // times both changed in same commit
   totalChanges: number;
-  coupling: number;          // coChangeCount / totalChanges ∈ [0,1]
+  coupling: number; // coChangeCount / totalChanges ∈ [0,1]
 }
 ```
 
@@ -420,15 +467,17 @@ interface CoChangeRecord {
 
 ### D4 — Test Coverage Signal
 
-**Current gap:** The ExtractionOracle's `testabilityScore` estimates how *easy* a region would be to test if extracted. But it doesn't know whether the region is *already tested*. A region with 0% test coverage has the highest extraction benefit (extracting it makes testing mandatory). A region with 100% coverage and a stable test suite should not be extracted unless there's another strong reason.
+**Current gap:** The ExtractionOracle's `testabilityScore` estimates how _easy_ a region would be to test if extracted. But it doesn't know whether the region is _already tested_. A region with 0% test coverage has the highest extraction benefit (extracting it makes testing mandatory). A region with 100% coverage and a stable test suite should not be extracted unless there's another strong reason.
 
 **Fix:** Integrate with VS Code's Test Coverage API (available in VS Code 1.88+):
+
 ```ts
 const coverage = await vscode.testing.getCoverageForFile(doc.uri);
 // coverage.statement.covered / coverage.statement.total → coverageRatio ∈ [0,1]
 ```
 
 Add to ExtractionOracle:
+
 - `coverageRatio === 0` → `+0.08` extraction pressure (untested code needs isolation)
 - `coverageRatio > 0.8` → `-0.06` extraction pressure (well-tested, stable)
 - No coverage data → no adjustment
@@ -442,6 +491,7 @@ Add to ExtractionOracle:
 **Current gap:** The extraction oracle doesn't know whether the project runs with `strict: true`. In strict mode, every `any`, every non-null assertion, and every implicit return type is an error — so ASTra's smell detections for these have different severity.
 
 **Fix:** Read the project's `tsconfig.json` via the `SemanticTypeResolver`'s `compilerOptions` and adjust smell severities:
+
 ```ts
 if (tsconfig.strict) {
   // Excessive `any` usage → upgrade from medium to high
@@ -464,23 +514,26 @@ Also adjust import resolver: in strict mode, `import type { ... }` is more impor
 ### E1 — Path Alias Resolution (`tsconfig.paths`)
 
 **Current gap:** If the project uses TypeScript path aliases:
+
 ```json
 { "paths": { "@/hooks/*": ["./src/hooks/*"], "~utils": ["./src/utils"] } }
 ```
+
 The `ImportResolver` generates relative paths (`../../../hooks/use-auth`) even when the project convention is to use aliases (`@/hooks/use-auth`). Generated files don't follow the project's import style.
 
 **Fix:** In `ImportResolver`, read `tsconfig.paths` via `SemanticTypeResolver`'s compiled options, and prefer alias paths over relative paths when available:
+
 ```ts
 function resolveWithAlias(
   absolutePath: string,
   pathAliases: Record<string, string[]>,
-  workspaceRoot: string
+  workspaceRoot: string,
 ): string {
   for (const [alias, patterns] of Object.entries(pathAliases)) {
     for (const pattern of patterns) {
-      const resolved = path.resolve(workspaceRoot, pattern.replace('*', ''));
+      const resolved = path.resolve(workspaceRoot, pattern.replace("*", ""));
       if (absolutePath.startsWith(resolved)) {
-        return absolutePath.replace(resolved, alias.replace('/*', '/'));
+        return absolutePath.replace(resolved, alias.replace("/*", "/"));
       }
     }
   }
@@ -495,14 +548,17 @@ function resolveWithAlias(
 ### E2 — Namespace Import Handling
 
 **Current gap:** When a region uses `Namespace.Something`:
+
 ```ts
-import * as React from 'react';
+import * as React from "react";
 // ...
-const el = React.createElement('div', null);
+const el = React.createElement("div", null);
 ```
+
 The `ImportResolver` currently tracks `React` as a used symbol and reproduced the `import * as React` correctly. But if the region uses `React.createElement` and the resolver is tracking at the identifier level, it may track `createElement` separately and not find it in any known import — emitting it as unresolved.
 
 **Fix:** In `collectUsedSymbols()`, when a `PropertyAccessExpression` matches a namespace alias from the SymbolTable, emit the namespace alias name (e.g. `React`) not the property name (`createElement`):
+
 ```ts
 if (ts.isPropertyAccessExpression(n)) {
   const objName = ts.isIdentifier(n.expression) ? n.expression.text : null;
@@ -523,11 +579,12 @@ if (ts.isPropertyAccessExpression(n)) {
 **Current gap:** `const { something } = await import('./module')` and `const mod = require('./module')` are not parsed as imports. The imported symbols are classified as unresolved, and the generated file either omits the import or emits a broken static import for what should be dynamic.
 
 **Fix:** In `buildSymbolTable()`, add a second pass for dynamic imports:
+
 ```ts
 // Look for: await import('specifier'), import('specifier').then(...)
 ts.forEachChild(sf, (node) => {
   const dynamicImports: ts.ImportCall[] = [];
-  walk(node, n => {
+  walk(node, (n) => {
     if (ts.isImportCall(n) && ts.isStringLiteral(n.arguments[0])) {
       dynamicImports.push(n);
     }
@@ -535,7 +592,11 @@ ts.forEachChild(sf, (node) => {
   for (const imp of dynamicImports) {
     const specifier = (imp.arguments[0] as ts.StringLiteral).text;
     symbolTable.imports.set(`__dynamic__${specifier}`, {
-      specifier, named: [], isSideEffect: false, isDynamic: true, line: lineOf(sf, imp.pos)
+      specifier,
+      named: [],
+      isSideEffect: false,
+      isDynamic: true,
+      line: lineOf(sf, imp.pos),
     });
   }
 });
@@ -554,6 +615,7 @@ Generated files preserve `await import(...)` syntax rather than converting to st
 **Current gap:** ASTra detects `console.log` as a smell in all non-test files. But in a Next.js API route or an Express middleware, `console.log` is the expected logging mechanism in many codebases. Similarly, `any` type usage is expected in type assertion utilities (`assertIsString`, `isRecord`).
 
 **Fix:** Add a smell suppression context system:
+
 ```ts
 // Per-smell context checks:
 'Console Logging': {
@@ -578,6 +640,7 @@ Generated files preserve `await import(...)` syntax rather than converting to st
 ### F2 — React Hook Rules Verification
 
 **Current gap:** ASTra detects `useState`, `useEffect` etc. by name but doesn't verify they follow the Rules of Hooks:
+
 - Hooks called inside conditions (`if (x) { useState(...) }`) — illegal
 - Hooks called inside loops — illegal
 - Hooks called in non-hook, non-component functions — illegal
@@ -585,11 +648,12 @@ Generated files preserve `await import(...)` syntax rather than converting to st
 These violations cause runtime errors but ASTra currently doesn't detect them.
 
 **Fix:** Add a `HookRulesAnalyser` that walks the AST of hook-containing regions:
+
 ```ts
 function detectHookRuleViolations(region: ASTRegion): RegionSmell[] {
   const smells: RegionSmell[] = [];
   const sf = ts.createSourceFile('', region.lines.join('\n'), ts.ScriptTarget.Latest, true);
-  
+
   // Walk looking for hook calls inside if/for/while
   function walk(node: ts.Node, inBranch: boolean, inLoop: boolean) {
     if (isHookCall(node)) {
@@ -616,10 +680,12 @@ function detectHookRuleViolations(region: ASTRegion): RegionSmell[] {
 ### F3 — Duplicate Logic Fingerprinting v2 (AST-Level)
 
 **Current gap:** The current duplicate logic detector uses a sliding window of raw source lines (with whitespace trimming). This misses:
+
 - Same logic with different variable names: `const result = arr.filter(x => x.active)` vs `const active = list.filter(item => item.active)` — same pattern, different names
 - Same logic with different formatting (different whitespace, different line breaks)
 
 **Fix:** Replace line-based fingerprinting with normalized AST fingerprinting:
+
 ```ts
 function normalizeAstFingerprint(node: ts.Node): string {
   // Walk AST, replace all Identifiers with their index in order of appearance
@@ -633,8 +699,8 @@ function normalizeAstFingerprint(node: ts.Node): string {
       return `ID_${identMap.get(key)}`;
     }
     const children: string[] = [];
-    ts.forEachChild(n, child => children.push(walk(child)));
-    return `${ts.SyntaxKind[n.kind]}(${children.join(',')})`;
+    ts.forEachChild(n, (child) => children.push(walk(child)));
+    return `${ts.SyntaxKind[n.kind]}(${children.join(",")})`;
   }
   return walk(node);
 }
@@ -648,34 +714,35 @@ Hash these fingerprints and compare across regions.
 
 ## Priority Matrix
 
-| Enhancement | Accuracy Gain | Effort | Priority |
-|-------------|-------------|--------|----------|
-| A4 — JSX Component classification fix | 5% | S | 🔥 Today |
-| A5 — export default arrow naming | ~100% of Next.js pages | S | 🔥 Today |
-| B4 — Side-effect import tracking | Import completeness +1% | S | 🔥 Today |
-| E1 — tsconfig.paths alias resolution | Convention alignment | M | 🔥 Sprint 1 |
-| D1 — Inbound vs outbound coupling | 40% false positive reduction | M | 🔥 Sprint 1 |
-| A1 — Decorator-aware boundaries | 100% Angular accuracy | S | 🔥 Sprint 1 |
-| F2 — Hook rules verification | Catches critical React bugs | M | Sprint 2 |
-| C1 — Token-aware Halstead | 15% Halstead accuracy | M | Sprint 2 |
-| A3 — Multi-declaration splitting | 12% utility recovery | S | Sprint 2 |
-| C4 — AST nesting depth | 6% testability accuracy | S | Sprint 2 |
-| D5 — strict mode awareness | Severity accuracy | S | Sprint 2 |
-| E2 — Namespace import handling | All Angular/namespace projects | M | Sprint 3 |
-| F3 — AST duplicate fingerprinting | 3× duplicate detection | M | Sprint 3 |
-| B1 — Transitive symbol resolution | External coupling accuracy | M | Sprint 3 |
-| C2 — Weighted CC | Contextual accuracy | S | Sprint 3 |
-| D4 — Test coverage signal | Coverage-driven alignment | L | Sprint 4 |
-| B2 — Call graph vs symbol graph | 8% class accuracy | L | Sprint 4 |
-| D2 — Git blame integration | Stability awareness | L | Sprint 4 |
-| E3 — Dynamic import detection | Dynamic-import accuracy | M | Sprint 4 |
-| D3 — Co-change detection | Hidden coupling | L | Sprint 5 |
-| F1 — Context-aware suppression | 30% fewer false smells | M | Sprint 5 |
-| A2 — Chained method detection | 8% service-layer accuracy | S | Sprint 5 |
-| C3 — Comment quality metric | MI accuracy | S | Sprint 5 |
-| B3 — Indirect cycle detection | Cycle completeness | M | Sprint 5 |
+| Enhancement                           | Accuracy Gain                  | Effort | Priority    |
+| ------------------------------------- | ------------------------------ | ------ | ----------- |
+| A4 — JSX Component classification fix | 5%                             | S      | 🔥 Today    |
+| A5 — export default arrow naming      | ~100% of Next.js pages         | S      | 🔥 Today    |
+| B4 — Side-effect import tracking      | Import completeness +1%        | S      | 🔥 Today    |
+| E1 — tsconfig.paths alias resolution  | Convention alignment           | M      | 🔥 Sprint 1 |
+| D1 — Inbound vs outbound coupling     | 40% false positive reduction   | M      | 🔥 Sprint 1 |
+| A1 — Decorator-aware boundaries       | 100% Angular accuracy          | S      | 🔥 Sprint 1 |
+| F2 — Hook rules verification          | Catches critical React bugs    | M      | Sprint 2    |
+| C1 — Token-aware Halstead             | 15% Halstead accuracy          | M      | Sprint 2    |
+| A3 — Multi-declaration splitting      | 12% utility recovery           | S      | Sprint 2    |
+| C4 — AST nesting depth                | 6% testability accuracy        | S      | Sprint 2    |
+| D5 — strict mode awareness            | Severity accuracy              | S      | Sprint 2    |
+| E2 — Namespace import handling        | All Angular/namespace projects | M      | Sprint 3    |
+| F3 — AST duplicate fingerprinting     | 3× duplicate detection         | M      | Sprint 3    |
+| B1 — Transitive symbol resolution     | External coupling accuracy     | M      | Sprint 3    |
+| C2 — Weighted CC                      | Contextual accuracy            | S      | Sprint 3    |
+| D4 — Test coverage signal             | Coverage-driven alignment      | L      | Sprint 4    |
+| B2 — Call graph vs symbol graph       | 8% class accuracy              | L      | Sprint 4    |
+| D2 — Git blame integration            | Stability awareness            | L      | Sprint 4    |
+| E3 — Dynamic import detection         | Dynamic-import accuracy        | M      | Sprint 4    |
+| D3 — Co-change detection              | Hidden coupling                | L      | Sprint 5    |
+| F1 — Context-aware suppression        | 30% fewer false smells         | M      | Sprint 5    |
+| A2 — Chained method detection         | 8% service-layer accuracy      | S      | Sprint 5    |
+| C3 — Comment quality metric           | MI accuracy                    | S      | Sprint 5    |
+| B3 — Indirect cycle detection         | Cycle completeness             | M      | Sprint 5    |
 
 **Reading the table:**
+
 - S = days of work, M = 1–2 weeks, L = 1+ months
 - Priority 🔥 = should implement immediately; these are bugs not just improvements
 - Sprint 1–5 = sequential planning horizon (2-week sprints)

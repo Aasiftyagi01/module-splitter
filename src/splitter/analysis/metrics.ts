@@ -16,6 +16,7 @@
  * ╚══════════════════════════════════════════════════════════════════════════════╝
  */
 
+import * as ts from "typescript";
 import type {
   ASTRegion,
   RegionMetrics,
@@ -101,22 +102,67 @@ interface HalsteadMetrics {
 }
 
 export function halsteadMetrics(src: string): HalsteadMetrics {
-  // Operators: symbols, keywords that branch/combine
-  const operators =
-    src.match(
-      /[\+\-\*\/\%\=\!\<\>]=?|&&|\|\||\?\?|=>|::|[\(\)\[\]\{\},;:\?]|\b(?:if|else|for|while|do|switch|case|break|return|typeof|instanceof|in|of|new|delete|void|throw|catch|finally|import|export)\b/g,
-    ) ?? [];
+  const operators = new Map<string, number>();
+  const operands = new Map<string, number>();
 
-  // Operands: identifiers, literals
-  const operands =
-    src.match(
-      /\b[a-zA-Z_$][a-zA-Z0-9_$]*\b|"[^"]*"|'[^']*'|`[^`]*`|\b\d+(?:\.\d+)?\b/g,
-    ) ?? [];
+  const add = (map: Map<string, number>, key: string): void => {
+    map.set(key, (map.get(key) ?? 0) + 1);
+  };
 
-  const n1 = new Set(operators).size || 1; // distinct operators
-  const n2 = new Set(operands).size || 1; // distinct operands
-  const N1 = operators.length || 1; // total operators
-  const N2 = operands.length || 1; // total operands
+  const isOperandLiteral = (kind: ts.SyntaxKind): boolean =>
+    kind === ts.SyntaxKind.NumericLiteral ||
+    kind === ts.SyntaxKind.StringLiteral ||
+    kind === ts.SyntaxKind.NoSubstitutionTemplateLiteral ||
+    kind === ts.SyntaxKind.TemplateHead ||
+    kind === ts.SyntaxKind.TemplateMiddle ||
+    kind === ts.SyntaxKind.TemplateTail ||
+    kind === ts.SyntaxKind.TrueKeyword ||
+    kind === ts.SyntaxKind.FalseKeyword ||
+    kind === ts.SyntaxKind.NullKeyword;
+
+  const isOperatorToken = (kind: ts.SyntaxKind): boolean => {
+    if (
+      kind === ts.SyntaxKind.Identifier ||
+      kind === ts.SyntaxKind.EndOfFileToken ||
+      isOperandLiteral(kind)
+    ) {
+      return false;
+    }
+    if (kind >= ts.SyntaxKind.FirstKeyword && kind <= ts.SyntaxKind.LastKeyword)
+      return true;
+    return ts.tokenToString(kind) !== undefined;
+  };
+
+  const hasJsx = /<\s*[A-Za-z][^>]*>/.test(src) && /<\/|\/>/.test(src);
+  const sf = ts.createSourceFile(
+    "metrics.tsx",
+    src,
+    ts.ScriptTarget.Latest,
+    true,
+    hasJsx ? ts.ScriptKind.TSX : ts.ScriptKind.TS,
+  );
+
+  ts.forEachToken(sf, (token) => {
+    if (ts.isIdentifier(token)) {
+      add(operands, token.text);
+      return;
+    }
+
+    if (isOperandLiteral(token.kind)) {
+      add(operands, token.getText(sf));
+      return;
+    }
+
+    if (isOperatorToken(token.kind)) {
+      const op = ts.tokenToString(token.kind) ?? token.getText(sf);
+      add(operators, op);
+    }
+  });
+
+  const n1 = operators.size || 1; // distinct operators
+  const n2 = operands.size || 1; // distinct operands
+  const N1 = [...operators.values()].reduce((s, v) => s + v, 0) || 1; // total operators
+  const N2 = [...operands.values()].reduce((s, v) => s + v, 0) || 1; // total operands
 
   const vocabulary = n1 + n2;
   const length = N1 + N2;

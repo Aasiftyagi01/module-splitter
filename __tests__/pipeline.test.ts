@@ -15,7 +15,10 @@ import {
   halsteadMetrics,
   computeRegionMetrics,
 } from "../src/splitter/analysis/metrics";
-import { detectRegionSmells } from "../src/splitter/analysis/smellDetector";
+import {
+  detectRegionSmells,
+  detectFileSmells,
+} from "../src/splitter/analysis/smellDetector";
 import { buildCoChangeRecordsFromHistories } from "../src/splitter/analysis/coChangeDetector";
 import { evaluateExtraction } from "../src/splitter/analysis/extractionOracle";
 import { renderSplitPlanHtml } from "../src/splitter/core/webviewRenderer";
@@ -391,6 +394,21 @@ export function B() {
     expect(graph.inboundCouplingScores.get(b.id) ?? 0).toBeGreaterThan(0);
   });
 
+  it("adds coupling pressure for external imports", () => {
+    const src = `
+import { uniq } from 'lodash';
+
+export function A(items: number[]) {
+  return uniq(items);
+}
+`.trim();
+    const { regions, symbolTable } = parseSourceFile(src, "external.ts");
+    const graph = buildDependencyGraph(regions, symbolTable);
+    const a = regions.find((r) => r.name === "A");
+    if (!a) return;
+    expect(graph.outboundCouplingScores.get(a.id) ?? 0).toBeGreaterThan(0);
+  });
+
   it("flags indirect cycles with multi-hop paths", () => {
     const parsed = parseSourceFile(INDIRECT_CYCLE_SRC, "cycle.ts");
     const graph = buildDependencyGraph(parsed.regions, parsed.symbolTable);
@@ -557,6 +575,13 @@ describe("Stage 3 — Metrics", () => {
         halsteadMetrics(short).volume,
       );
     });
+    it("ignores operators inside string literals", () => {
+      const withOps = `const label = "if (a > b) { return c; }";`;
+      const withoutOps = `const label = "noop";`;
+      expect(halsteadMetrics(withOps).volume).toBe(
+        halsteadMetrics(withoutOps).volume,
+      );
+    });
   });
 
   describe("computeRegionMetrics", () => {
@@ -646,6 +671,77 @@ export function useAsync() {
     expect(s).toBeDefined();
   });
 
+  it("detects hook calls inside conditions", () => {
+    const src = `
+export function useBad(flag: boolean) {
+  if (flag) {
+    useState(0);
+  }
+  return flag;
+}
+`.trim();
+    const { regions, symbolTable } = parseSourceFile(src, "hook.ts");
+    const hook = regions.find((r) => r.kind === "hook");
+    if (!hook) return;
+    const smells = detectRegionSmells(
+      hook,
+      hook.lines.length,
+      2,
+      2,
+      symbolTable,
+      "hook.ts",
+    );
+    expect(smells.some((s) => s.name === "Hook Called Inside Condition")).toBe(
+      true,
+    );
+  });
+
+  it("detects hook calls inside loops", () => {
+    const src = `
+export function useLoop(items: number[]) {
+  for (const item of items) {
+    useEffect(() => {}, []);
+  }
+  return items.length;
+}
+`.trim();
+    const { regions, symbolTable } = parseSourceFile(src, "hook.ts");
+    const hook = regions.find((r) => r.kind === "hook");
+    if (!hook) return;
+    const smells = detectRegionSmells(
+      hook,
+      hook.lines.length,
+      2,
+      2,
+      symbolTable,
+      "hook.ts",
+    );
+    expect(smells.some((s) => s.name === "Hook Called Inside Loop")).toBe(true);
+  });
+
+  it("detects hooks used outside components or hooks", () => {
+    const src = `
+export function helper() {
+  useState(0);
+  return 1;
+}
+`.trim();
+    const { regions, symbolTable } = parseSourceFile(src, "helper.ts");
+    const fn = regions.find((r) => r.name === "helper");
+    if (!fn) return;
+    const smells = detectRegionSmells(
+      fn,
+      fn.lines.length,
+      1,
+      1,
+      symbolTable,
+      "helper.ts",
+    );
+    expect(
+      smells.some((s) => s.name === "Hook Called Outside Component/Hook"),
+    ).toBe(true);
+  });
+
   it("detects oversized module", () => {
     const bigFn = `export function big() {\n${Array(250).fill("  const x = 1;").join("\n")}\n}`;
     const { regions, symbolTable } = parseSourceFile(bigFn, "big.ts");
@@ -719,6 +815,30 @@ export function assertIsString(value: any, other: any, extra: any) {
       "guards.ts",
     );
     expect(smells.some((s) => s.name === "Excessive `any` Usage")).toBe(false);
+  });
+});
+
+describe("Stage 4 — detectFileSmells", () => {
+  it("detects duplicate logic with AST fingerprinting", () => {
+    const src = `
+export function alpha(list: Array<{ id: number; active: boolean }>) {
+  const result = list.filter(item => item.active);
+  const mapped = result.map(item => item.id);
+  return mapped;
+}
+
+export function beta(items: Array<{ id: number; active: boolean }>) {
+  const res = items.filter(value => value.active);
+  const mapped = res.map(value => value.id);
+  return mapped;
+}
+`.trim();
+    const parsed = parseSourceFile(src, "dupe.ts");
+    const smellMap = new Map(parsed.regions.map((r) => [r.id, []]));
+    const smells = detectFileSmells(parsed.regions, smellMap);
+    expect(smells.some((s) => s.name === "Duplicate Logic Detected")).toBe(
+      true,
+    );
   });
 });
 
