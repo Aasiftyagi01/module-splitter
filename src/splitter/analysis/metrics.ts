@@ -104,7 +104,6 @@ interface HalsteadMetrics {
 export function halsteadMetrics(src: string): HalsteadMetrics {
   const operators = new Map<string, number>();
   const operands = new Map<string, number>();
-
   const add = (map: Map<string, number>, key: string): void => {
     map.set(key, (map.get(key) ?? 0) + 1);
   };
