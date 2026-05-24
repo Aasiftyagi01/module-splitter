@@ -89,6 +89,38 @@ function maxDepth(src: string): number {
   return max;
 }
 
+function leftmostQualifiedIdentifier(
+  name: ts.QualifiedName,
+): ts.Identifier | null {
+  let current: ts.EntityName = name;
+  while (ts.isQualifiedName(current)) {
+    current = current.left;
+  }
+  return ts.isIdentifier(current) ? current : null;
+}
+
+function collectUsedSymbols(node: ts.Node): Set<string> {
+  const used = new Set<string>();
+
+  const walkSym = (n: ts.Node): void => {
+    if (ts.isQualifiedName(n)) {
+      const leftmost = leftmostQualifiedIdentifier(n);
+      if (leftmost) used.add(leftmost.text);
+      return;
+    }
+    if (ts.isIdentifier(n)) {
+      const parent = n.parent;
+      if (!ts.isPropertyAccessExpression(parent) || parent.name !== n) {
+        used.add(n.text);
+      }
+    }
+    ts.forEachChild(n, walkSym);
+  };
+
+  walkSym(node);
+  return used;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sub-splitter result
 // ─────────────────────────────────────────────────────────────────────────────
@@ -129,12 +161,7 @@ function splitObjectMethods(
     const hasJSX = containsJSX(prop);
 
     // Collect used symbols: walk the initializer
-    const used = new Set<string>();
-    const walkSym = (n: ts.Node) => {
-      if (ts.isIdentifier(n)) used.add(n.text);
-      ts.forEachChild(n, walkSym);
-    };
-    walkSym(val);
+    const used = collectUsedSymbols(val);
 
     results.push({
       id: newId(name),
@@ -213,12 +240,7 @@ function splitNamespaceMembers(
     const src = lines.join("\n");
     const hasJSX = containsJSX(stmt);
 
-    const used = new Set<string>();
-    const walkSym = (n: ts.Node) => {
-      if (ts.isIdentifier(n)) used.add(n.text);
-      ts.forEachChild(n, walkSym);
-    };
-    walkSym(stmt);
+    const used = collectUsedSymbols(stmt);
 
     results.push({
       id: newId(`${parentRegion.name}_${name}`),

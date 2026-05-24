@@ -262,7 +262,8 @@ export interface ExtractionDecision {
     | "hoc"
     | "constants"
     | "types"
-    | "providers";
+    | "providers"
+    | "stores";
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -415,6 +416,9 @@ export interface FrameworkSmellRecord {
   autoFixable: boolean;
   framework: "vue" | "angular" | "svelte";
   line: number;
+  suggestedFileName?: string;
+  generatedContent?: string;
+  remediationSteps?: string[];
 }
 
 export interface SplitPlan {
@@ -445,7 +449,7 @@ export interface SplitPlan {
   /** Framework-specific smells (Vue/Angular/Svelte) */
   frameworkSmells: FrameworkSmellRecord[];
   /** Which framework was detected */
-  detectedFramework: "vue" | "angular" | "svelte" | "react" | "none";
+  detectedFramework: "vue" | "angular" | "svelte" | "react" | "qwik" | "none";
 }
 
 export interface TestFileSuggestion {
