@@ -9,7 +9,7 @@
 - [x] A3 — Multi-declaration splitting (12% utility recovery, S, Sprint 2)
 - [x] C4 — AST nesting depth (6% testability accuracy, S, Sprint 2)
 - [x] D5 — strict mode awareness (Severity accuracy, S, Sprint 2)
-- [ ] E2 — Namespace import handling (All Angular/namespace projects, M, Sprint 3)
+- [x] E2 — Namespace import handling (All Angular/namespace projects, M, Sprint 3)
 - [x] F3 — AST duplicate fingerprinting (3× duplicate detection, M, Sprint 3)
 - [x] B1 — Transitive symbol resolution (External coupling accuracy, M, Sprint 3)
 - [x] C2 — Weighted CC (Contextual accuracy, S, Sprint 3)

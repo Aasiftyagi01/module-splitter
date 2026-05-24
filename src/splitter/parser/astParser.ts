@@ -173,6 +173,16 @@ function classifySymbolUsage(node: ts.Identifier): SymbolUsageKind {
   return "reference";
 }
 
+function leftmostQualifiedIdentifier(
+  name: ts.QualifiedName,
+): ts.Identifier | null {
+  let current: ts.EntityName = name;
+  while (ts.isQualifiedName(current)) {
+    current = current.left;
+  }
+  return ts.isIdentifier(current) ? current : null;
+}
+
 /** Collect identifier references and the context each one appears in */
 function collectSymbolUsages(node: ts.Node): {
   usedSymbols: Set<string>;
@@ -189,6 +199,16 @@ function collectSymbolUsages(node: ts.Node): {
   };
 
   const walk = (n: ts.Node): void => {
+    if (ts.isQualifiedName(n)) {
+      const leftmost = leftmostQualifiedIdentifier(n);
+      if (leftmost) {
+        const text = leftmost.text;
+        if (text && !/^[a-z]{1,3}$/.test(text)) {
+          record(text, classifySymbolUsage(leftmost));
+        }
+      }
+      return;
+    }
     if (ts.isIdentifier(n)) {
       const parent = n.parent;
       // Skip property access right-hand identifiers (obj.prop → don't collect "prop")
